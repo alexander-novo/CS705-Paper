@@ -2,6 +2,7 @@
 
 #include <Eigen/Core>
 #include <algorithm>
+#include <chrono>
 #include <vector>
 
 #include "common.h"
@@ -31,11 +32,10 @@ void matrixVectorMultiplyDiag(const std::vector<Ciphertext>& mat, unsigned mat_r
                               Ciphertext& vec_out, Evaluator& evaluator, GaloisKeys& gal_keys, RelinKeys& relin_keys);
 
 int main() {
-	// Eigen::MatrixXd A = Eigen::MatrixXd::Random();
-	// Eigen::VectorXd B = Eigen::VectorXd::Random();
+	std::cout << "Begin Encryption Setup & Data Loading..." << std::endl;
+	auto start = std::chrono::high_resolution_clock::now();
 
-	// std::cout << A << '\n' << B << "\n\n";
-
+#pragma region Encryption parameters
 	EncryptionParameters params(scheme_type::ckks);
 
 	params.set_poly_modulus_degree(poly_modulus_degree);
@@ -61,7 +61,9 @@ int main() {
 	Evaluator evaluator(context);
 	Decryptor decryptor(context, secret_key);
 	CKKSEncoder encoder(context);
+#pragma endregion
 
+#pragma region Loading, encoding, and encrypting data
 	std::vector<Eigen::VectorXd> samples;
 	std::vector<unsigned> labels;
 	std::vector<std::string> trueLabels;
@@ -73,10 +75,12 @@ int main() {
 	std::vector<Plaintext> weights_plain;
 	std::vector<Plaintext> weights_plainSIMD;
 	Plaintext sample_plain;
+	Plaintext sample_plainSIMD;
 
 	std::vector<std::vector<Ciphertext>> weights_enc;
 	std::vector<std::vector<Ciphertext>> weights_encSIMD;
-	Ciphertext sample_enc;
+	std::vector<Ciphertext> sample_enc;
+	Ciphertext sample_encSIMD;
 
 	std::ifstream paramFile("out/square_params.dat");
 	unsigned count;
@@ -117,24 +121,71 @@ int main() {
 		}
 	}
 
-	std::vector<double> sample;
+	encodeVectorSIMD(encoder, scale, sample_plainSIMD, samples, maxWidth);
+	encryptor.encrypt(sample_plainSIMD, sample_encSIMD);
 
-	encodeVectorSIMD(encoder, scale, sample_plain, samples, maxWidth);
-	encryptor.encrypt(sample_plain, sample_enc);
+	sample_enc.resize(samples.size());
+	for (unsigned i = 0; i < samples.size(); i++) {
+		encodeVector(encoder, scale, sample_plain, samples[i]);
+		encryptor.encrypt(sample_plain, sample_enc[i]);
+	}
+#pragma endregion
 
-	for (unsigned j = 0; j < weights_enc.size(); j++) {
-		matrixVectorMultiplyDiag(weights_encSIMD[j], weights[j].rows(), sample_enc, sample_enc, evaluator, gal_keys,
-		                         relin_keys);
+	std::cout << std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() -
+	                                                                   start)
+	                     .count() /
+	                 1e6
+	          << "s taken.\nBegin Baseline Feedforward Evaluation..." << std::endl;
+	start = std::chrono::high_resolution_clock::now();
 
-		evaluator.square_inplace(sample_enc);
-		evaluator.relinearize_inplace(sample_enc, relin_keys);
-		evaluator.rescale_to_next_inplace(sample_enc);
+#pragma region Evaluate Baseline Feedforward
+	Eigen::VectorXd feed;
+	unsigned numCorrect = 0;
+	for (unsigned i = 0; i < samples.size(); i++) {
+		feed = samples[i];
+
+		unsigned w;
+		for (w = 0; w < weights.size() - 1; w++) { feed = (weights[w] * feed).array().square(); }
+		feed = weights[w] * feed;
+
+		unsigned maxIndex = 0;
+		for (unsigned j = 1; j < 3; j++) {
+			if (feed(j, 0) > feed(maxIndex, 0)) maxIndex = j;
+		}
+		if (maxIndex == labels[i]) numCorrect++;
 	}
 
-	decryptor.decrypt(sample_enc, sample_plain);
-	encoder.decode(sample_plain, sample);
+	std::cout << "Baseline accuracy: " << numCorrect / (double) samples.size() << std::endl;
+#pragma endregion
 
-	unsigned numCorrect = 0;
+	std::cout << std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() -
+	                                                                   start)
+	                     .count() /
+	                 1e6
+	          << "s taken.\nBegin SIMD Feedforward Evaluation..." << std::endl;
+	start = std::chrono::high_resolution_clock::now();
+
+#pragma region Evaluate SIMD Encrypted Feedforward
+	std::vector<double> sample;
+
+	unsigned j;
+	for (j = 0; j < weights_enc.size() - 1; j++) {
+		matrixVectorMultiplyDiag(weights_encSIMD[j], weights[j].rows(), sample_encSIMD, sample_encSIMD, evaluator,
+		                         gal_keys, relin_keys);
+
+		evaluator.square_inplace(sample_encSIMD);
+		evaluator.relinearize_inplace(sample_encSIMD, relin_keys);
+		evaluator.rescale_to_next_inplace(sample_encSIMD);
+	}
+
+	// Don't apply square activation to last layer
+	matrixVectorMultiplyDiag(weights_encSIMD[j], weights[j].rows(), sample_encSIMD, sample_encSIMD, evaluator, gal_keys,
+	                         relin_keys);
+
+	decryptor.decrypt(sample_encSIMD, sample_plainSIMD);
+	encoder.decode(sample_plainSIMD, sample);
+
+	numCorrect = 0;
 	for (unsigned i = 0; i < samples.size(); i++) {
 		bool correct = true;
 		for (unsigned j = 0; j < 3; j++) { correct &= sample[i * maxWidth + labels[i]] >= sample[i * maxWidth + j]; }
@@ -143,32 +194,51 @@ int main() {
 	}
 
 	std::cout << "SIMD Accuracy: " << (numCorrect / (double) samples.size()) << std::endl;
+#pragma endregion
+
+	std::cout << std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() -
+	                                                                   start)
+	                     .count() /
+	                 1e6
+	          << "s taken.\nBegin Normal Encrypted Feedforward Evaluation..." << std::endl;
+	start = std::chrono::high_resolution_clock::now();
+
+#pragma region Evaluate Normal Encrypted Feedforward
 	numCorrect = 0;
 
 	for (unsigned i = 0; i < samples.size(); i++) {
-		encodeVector(encoder, scale, sample_plain, samples[i]);
-		encryptor.encrypt(sample_plain, sample_enc);
+		unsigned j;
+		for (j = 0; j < weights_enc.size() - 1; j++) {
+			matrixVectorMultiplyDiag(weights_enc[j], weights[j].rows(), sample_enc[i], sample_enc[i], evaluator,
+			                         gal_keys, relin_keys);
 
-		for (unsigned j = 0; j < weights_enc.size(); j++) {
-			matrixVectorMultiplyDiag(weights_enc[j], weights[j].rows(), sample_enc, sample_enc, evaluator, gal_keys,
-			                         relin_keys);
-
-			evaluator.square_inplace(sample_enc);
-			evaluator.relinearize_inplace(sample_enc, relin_keys);
-			evaluator.rescale_to_next_inplace(sample_enc);
+			evaluator.square_inplace(sample_enc[i]);
+			evaluator.relinearize_inplace(sample_enc[i], relin_keys);
+			evaluator.rescale_to_next_inplace(sample_enc[i]);
 		}
 
-		decryptor.decrypt(sample_enc, sample_plain);
+		// Don't apply square activation to last layer
+		matrixVectorMultiplyDiag(weights_enc[j], weights[j].rows(), sample_enc[i], sample_enc[i], evaluator, gal_keys,
+		                         relin_keys);
+
+		decryptor.decrypt(sample_enc[i], sample_plain);
 		encoder.decode(sample_plain, sample);
 
-		bool correct = true;
-		for (unsigned j = 0; j < 3; j++) { correct &= sample[labels[i]] >= sample[j]; }
-		if (correct) numCorrect++;
-
-		if ((i + 1) % 10 == 0) { std::cout << i + 1 << '/' << samples.size() << std::endl; }
+		unsigned maxIndex = 0;
+		for (unsigned j = 1; j < 3; j++) {
+			if (sample[j] > sample[maxIndex]) maxIndex = j;
+		}
+		if (maxIndex == labels[i]) numCorrect++;
 	}
 
 	std::cout << "Normal Accuracy: " << (numCorrect / (double) samples.size()) << std::endl;
+#pragma endregion
+
+	std::cout << std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() -
+	                                                                   start)
+	                     .count() /
+	                 1e6
+	          << "s taken." << std::endl;
 
 	return 0;
 }
@@ -205,7 +275,9 @@ void encodeMatrixDiagonal(CKKSEncoder& encoder, double scale, std::vector<Plaint
 
 		// Now the normal diagonals. i is the column of the first element in the diagonal
 		for (unsigned i = 0; i < in_mat.cols(); i++) {
-			diag.resize(in_mat.rows() - i);
+			// If in_mat is wide, the length of the diagonals will continue to be the number of rows for a while.
+			// Otherwise, the diagonal will reduce in size by one
+			if (i < in_mat.cols() - in_mat.rows()) diag.resize(in_mat.rows() - i);
 
 			unsigned j;
 			// j is the element in the column (also the row of the element) and i + j is the column
@@ -260,17 +332,9 @@ void encodeMatrixDiagonalSIMD(CKKSEncoder& encoder, double scale, std::vector<Pl
 			for (; j < in_mat.rows(); j++) { diag[j] = in_mat(j, j - i); }
 			for (; j < maxWidth; j++) { diag[j] = 0; }
 
-			for (unsigned j = 0; j < diag.size(); j++) { std::cout << diag[j] << ' '; }
-			std::cout << '\n';
-
 			// Diagonal is encoded as before, but now we replicate it some number of times
 			for (unsigned n = 0; n < ammountSIMD; n++) {
 				diag.insert(diag.end(), diag.begin(), diag.begin() + maxWidth);
-
-				if (n == 0) {
-					for (unsigned j = 0; j < diag.size(); j++) { std::cout << diag[j] << ' '; }
-					std::cout << "\n\n";
-				}
 			}
 
 			encoder.encode(diag, scale, out_mat[in_mat.rows() - 1 - i]);
@@ -284,16 +348,8 @@ void encodeMatrixDiagonalSIMD(CKKSEncoder& encoder, double scale, std::vector<Pl
 			// Same as before, but we fill out the rest of the zeros for easy replication
 			for (; j < maxWidth; j++) { diag[j] = 0; }
 
-			for (unsigned j = 0; j < diag.size(); j++) { std::cout << diag[j] << ' '; }
-			std::cout << '\n';
-
 			for (unsigned n = 0; n < ammountSIMD; n++) {
 				diag.insert(diag.end(), diag.begin(), diag.begin() + maxWidth);
-
-				if (n == 0) {
-					for (unsigned j = 0; j < diag.size(); j++) { std::cout << diag[j] << ' '; }
-					std::cout << "\n\n";
-				}
 			}
 
 			encoder.encode(diag, scale, out_mat[i + in_mat.rows() - 1]);
