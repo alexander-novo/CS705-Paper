@@ -19,7 +19,13 @@ const size_t slots               = poly_modulus_degree / 2;
 void encodeMatrixDiagonal(CKKSEncoder& encoder, double scale, std::vector<Plaintext>& out_mat,
                           const Eigen::MatrixXd& in_mat);
 
+void encodeMatrixDiagonalSIMD(CKKSEncoder& encoder, double scale, std::vector<Plaintext>& out_mat,
+                              const Eigen::MatrixXd& in_mat, unsigned ammountSIMD, unsigned maxWidth);
+
 void encodeVector(CKKSEncoder& encoder, double scale, Plaintext& out_vec, const Eigen::VectorXd& in_vec);
+
+void encodeVectorSIMD(CKKSEncoder& encoder, double scale, Plaintext& out_vec,
+                      const std::vector<Eigen::VectorXd>& in_vec, unsigned maxWidth);
 
 void matrixVectorMultiplyDiag(const std::vector<Ciphertext>& mat, unsigned mat_rows, const Ciphertext& vec_in,
                               Ciphertext& vec_out, Evaluator& evaluator, GaloisKeys& gal_keys, RelinKeys& relin_keys);
@@ -65,9 +71,11 @@ int main() {
 
 	std::vector<Eigen::MatrixXd> weights;
 	std::vector<Plaintext> weights_plain;
+	std::vector<Plaintext> weights_plainSIMD;
 	Plaintext sample_plain;
 
 	std::vector<std::vector<Ciphertext>> weights_enc;
+	std::vector<std::vector<Ciphertext>> weights_encSIMD;
 	Ciphertext sample_enc;
 
 	std::ifstream paramFile("out/square_params.dat");
@@ -75,6 +83,7 @@ int main() {
 	paramFile >> count;
 	weights.resize(count);
 	weights_enc.resize(count);
+	weights_encSIMD.resize(count);
 	for (unsigned i = 0; i < count; i++) {
 		unsigned rows, cols;
 		paramFile >> rows >> cols;
@@ -96,7 +105,46 @@ int main() {
 		for (unsigned j = 0; j < weights_plain.size(); j++) { encryptor.encrypt(weights_plain[j], weights_enc[i][j]); }
 	}
 
+	unsigned maxWidth = samples.front().rows();
+
+	for (unsigned i = 0; i < weights.size(); i++) { maxWidth = std::max(maxWidth, (unsigned) weights[i].rows()); }
+	for (unsigned i = 0; i < weights.size(); i++) {
+		encodeMatrixDiagonalSIMD(encoder, scale, weights_plainSIMD, weights[i], samples.size(), maxWidth);
+
+		weights_encSIMD[i].resize(weights_plainSIMD.size());
+		for (unsigned j = 0; j < weights_plainSIMD.size(); j++) {
+			encryptor.encrypt(weights_plainSIMD[j], weights_encSIMD[i][j]);
+		}
+	}
+
 	std::vector<double> sample;
+
+	encodeVectorSIMD(encoder, scale, sample_plain, samples, maxWidth);
+	encryptor.encrypt(sample_plain, sample_enc);
+
+	for (unsigned j = 0; j < weights_enc.size(); j++) {
+		matrixVectorMultiplyDiag(weights_encSIMD[j], weights[j].rows(), sample_enc, sample_enc, evaluator, gal_keys,
+		                         relin_keys);
+
+		evaluator.square_inplace(sample_enc);
+		evaluator.relinearize_inplace(sample_enc, relin_keys);
+		evaluator.rescale_to_next_inplace(sample_enc);
+	}
+
+	decryptor.decrypt(sample_enc, sample_plain);
+	encoder.decode(sample_plain, sample);
+
+	unsigned numCorrect = 0;
+	for (unsigned i = 0; i < samples.size(); i++) {
+		bool correct = true;
+		for (unsigned j = 0; j < 3; j++) { correct &= sample[i * maxWidth + labels[i]] >= sample[i * maxWidth + j]; }
+
+		if (correct) numCorrect++;
+	}
+
+	std::cout << "SIMD Accuracy: " << (numCorrect / (double) samples.size()) << std::endl;
+	numCorrect = 0;
+
 	for (unsigned i = 0; i < samples.size(); i++) {
 		encodeVector(encoder, scale, sample_plain, samples[i]);
 		encryptor.encrypt(sample_plain, sample_enc);
@@ -113,9 +161,14 @@ int main() {
 		decryptor.decrypt(sample_enc, sample_plain);
 		encoder.decode(sample_plain, sample);
 
-		for (unsigned i = 0; i < 3; i++) { std::cout << sample[i] << " "; }
-		std::cout << labels[i] << std::endl;
+		bool correct = true;
+		for (unsigned j = 0; j < 3; j++) { correct &= sample[labels[i]] >= sample[j]; }
+		if (correct) numCorrect++;
+
+		if ((i + 1) % 10 == 0) { std::cout << i + 1 << '/' << samples.size() << std::endl; }
 	}
+
+	std::cout << "Normal Accuracy: " << (numCorrect / (double) samples.size()) << std::endl;
 
 	return 0;
 }
@@ -186,9 +239,103 @@ void encodeMatrixDiagonal(CKKSEncoder& encoder, double scale, std::vector<Plaint
 	unsigned offset = out_mat.size() < slots ? in_mat.rows() - 1 : 0;
 }
 
+void encodeMatrixDiagonalSIMD(CKKSEncoder& encoder, double scale, std::vector<Plaintext>& out_mat,
+                              const Eigen::MatrixXd& in_mat, unsigned ammountSIMD, unsigned maxWidth) {
+	// Still same number of diagonals as non-SIMD, since the matrices are all stored on the diagonal
+	out_mat.resize(std::min(slots, (size_t) (in_mat.rows() + in_mat.cols() - 1)));
+	std::vector<double> diag;
+	// If there are zero diagonals, we don't want to calculate/store those zero diagonals, so we instead store the last
+	// nonzero diagonals (the ones below the main diagonal in the input matrix) before the initial diagonal (the main
+	// diagonal)
+
+	// Each diagonal below the main diagonal is the same size as before, but replicated some number of times for
+	// SIMD. The replication process is what increases the size. To simplify this process, diagonals above the main
+	// diagonal will store a couple of extra zeros at the end. Therefore every diagonal is the same size
+	diag.resize(maxWidth);
+
+	if (out_mat.size() < slots) {
+		for (unsigned i = in_mat.rows() - 1; i > 0; i--) {
+			unsigned j;
+			for (j = 0; j < i; j++) { diag[j] = 0; }
+			for (; j < in_mat.rows(); j++) { diag[j] = in_mat(j, j - i); }
+			for (; j < maxWidth; j++) { diag[j] = 0; }
+
+			for (unsigned j = 0; j < diag.size(); j++) { std::cout << diag[j] << ' '; }
+			std::cout << '\n';
+
+			// Diagonal is encoded as before, but now we replicate it some number of times
+			for (unsigned n = 0; n < ammountSIMD; n++) {
+				diag.insert(diag.end(), diag.begin(), diag.begin() + maxWidth);
+
+				if (n == 0) {
+					for (unsigned j = 0; j < diag.size(); j++) { std::cout << diag[j] << ' '; }
+					std::cout << "\n\n";
+				}
+			}
+
+			encoder.encode(diag, scale, out_mat[in_mat.rows() - 1 - i]);
+			diag.resize(maxWidth);
+		}
+
+		for (unsigned i = 0; i < in_mat.cols(); i++) {
+			unsigned j;
+			for (j = 0; j < in_mat.rows() && i + j < in_mat.cols(); j++) { diag[j] = in_mat(j, i + j); }
+
+			// Same as before, but we fill out the rest of the zeros for easy replication
+			for (; j < maxWidth; j++) { diag[j] = 0; }
+
+			for (unsigned j = 0; j < diag.size(); j++) { std::cout << diag[j] << ' '; }
+			std::cout << '\n';
+
+			for (unsigned n = 0; n < ammountSIMD; n++) {
+				diag.insert(diag.end(), diag.begin(), diag.begin() + maxWidth);
+
+				if (n == 0) {
+					for (unsigned j = 0; j < diag.size(); j++) { std::cout << diag[j] << ' '; }
+					std::cout << "\n\n";
+				}
+			}
+
+			encoder.encode(diag, scale, out_mat[i + in_mat.rows() - 1]);
+			diag.resize(maxWidth);
+		}
+	} else {
+		for (unsigned i = 0; i < slots; i++) {
+			unsigned j;
+			for (j = 0; j < in_mat.rows() && i + j < in_mat.cols(); j++) { diag[j] = in_mat(j, i + j); }
+
+			if (slots - i < in_mat.rows()) {
+				for (; j < slots - i; j++) { diag[j] = 0; }
+				for (unsigned k = 0; j < in_mat.rows(); j++, k++) { diag[j] = in_mat(j, k); }
+			}
+
+			for (; j < maxWidth; j++) { diag[j] = 0; }
+
+			for (unsigned n = 0; n < ammountSIMD; n++) {
+				diag.insert(diag.end(), diag.begin(), diag.begin() + maxWidth);
+			}
+
+			encoder.encode(diag, scale, out_mat[i]);
+			diag.resize(maxWidth);
+		}
+	}
+}
+
 void encodeVector(CKKSEncoder& encoder, double scale, Plaintext& out_vec, const Eigen::VectorXd& in_vec) {
 	std::vector<double> vec(in_vec.rows());
 	for (unsigned i = 0; i < in_vec.rows(); i++) { vec[i] = in_vec(i, 0); }
+
+	encoder.encode(vec, scale, out_vec);
+}
+
+void encodeVectorSIMD(CKKSEncoder& encoder, double scale, Plaintext& out_vec,
+                      const std::vector<Eigen::VectorXd>& in_vec, unsigned maxWidth) {
+	std::vector<double> vec(maxWidth * in_vec.size(), 0.0);
+	for (unsigned i = 0; i < in_vec.size(); i++) {
+		unsigned j;
+		for (j = 0; j < in_vec[i].rows(); j++) { vec[i * maxWidth + j] = in_vec[i](j, 0); }
+		for (; j < maxWidth; j++) { vec[i * maxWidth + j] = 0; }
+	}
 
 	encoder.encode(vec, scale, out_vec);
 }
