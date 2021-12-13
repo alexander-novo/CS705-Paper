@@ -11,11 +11,15 @@ using seal::CoeffModulus, seal::EncryptionParameters, seal::scheme_type, seal::S
     seal::PublicKey, seal::RelinKeys, seal::GaloisKeys, seal::Encryptor, seal::Evaluator, seal::Decryptor,
     seal::CKKSEncoder, seal::Plaintext, seal::Ciphertext;
 
-// const unsigned N                 = 5;
 const size_t poly_modulus_degree = 16384;
 const size_t slots               = poly_modulus_degree / 2;
-// typedef Eigen::Matrix<double, N, N> Eigen::MatrixXd;
-// typedef Eigen::Vector<double, N> Eigen::VectorXd;
+
+#pragma region Function Declarations
+void compareMatrixEncodings(CKKSEncoder& encoder, Evaluator& evaluator, Encryptor& encryptor, Decryptor& decryptor,
+                            GaloisKeys& gal_keys, RelinKeys& relin_keys, double scale, unsigned max_d);
+
+void encodeMatrixRows(CKKSEncoder& encoder, double scale, std::vector<Plaintext>& out_mat,
+                      const Eigen::MatrixXd& in_mat);
 
 void encodeMatrixDiagonal(CKKSEncoder& encoder, double scale, std::vector<Plaintext>& out_mat,
                           const Eigen::MatrixXd& in_mat);
@@ -28,8 +32,14 @@ void encodeVector(CKKSEncoder& encoder, double scale, Plaintext& out_vec, const 
 void encodeVectorSIMD(CKKSEncoder& encoder, double scale, Plaintext& out_vec,
                       const std::vector<Eigen::VectorXd>& in_vec, unsigned maxWidth);
 
+void matrixVectorMultiplyRows(const std::vector<Ciphertext>& mat, unsigned mat_cols, const Ciphertext& vec_in,
+                              Ciphertext& vec_out, Evaluator& evaluator, Plaintext unitMult, GaloisKeys& gal_keys,
+                              RelinKeys& relin_keys);
+
 void matrixVectorMultiplyDiag(const std::vector<Ciphertext>& mat, unsigned mat_rows, const Ciphertext& vec_in,
                               Ciphertext& vec_out, Evaluator& evaluator, GaloisKeys& gal_keys, RelinKeys& relin_keys);
+
+#pragma endregion
 
 int main() {
 	std::cout << "Begin Encryption Setup & Data Loading..." << std::endl;
@@ -130,6 +140,15 @@ int main() {
 		encryptor.encrypt(sample_plain, sample_enc[i]);
 	}
 #pragma endregion
+
+	std::cout << std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() -
+	                                                                   start)
+	                     .count() /
+	                 1e6
+	          << "s taken.\nBegin Matrix Encoding Comparison..." << std::endl;
+	start = std::chrono::high_resolution_clock::now();
+
+	compareMatrixEncodings(encoder, evaluator, encryptor, decryptor, gal_keys, relin_keys, scale, 100);
 
 	std::cout << std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() -
 	                                                                   start)
@@ -241,6 +260,92 @@ int main() {
 	          << "s taken." << std::endl;
 
 	return 0;
+}
+
+void compareMatrixEncodings(CKKSEncoder& encoder, Evaluator& evaluator, Encryptor& encryptor, Decryptor& decryptor,
+                            GaloisKeys& gal_keys, RelinKeys& relin_keys, double scale, unsigned max_d) {
+	std::ofstream out("out/matrix-encoding-comp.dat");
+	Eigen::MatrixXd A;
+	Eigen::VectorXd x, y, y_test;
+
+	std::vector<Plaintext> A_plain;
+	Plaintext x_plain, y_plain;
+
+	std::vector<Ciphertext> A_enc;
+	Ciphertext x_enc, y_enc;
+
+	// unitMult is the vector <1, 0, 0, 0, ..., 0> for the purposes of performing matrix-vector multiplication with
+	// row-encoded matrices.
+	std::vector<double> unit = {1.0};
+	Plaintext unitMult;
+
+	std::vector<double> test_out;
+
+	encoder.encode(unit, scale, unitMult);
+
+	out << "# Comparison of time (in seconds) it takes to multiply a dxd matrix by a d-dimensional vector based on "
+	       "encoding\nd   Row-Time   Row-Error   Diagonal-Time   Diagonal-Error\n";
+	for (unsigned d = 1; d <= max_d; d++) {
+		A = Eigen::MatrixXd::Random(d, d);
+		x = Eigen::VectorXd::Random(d);
+		y = A * x;
+		y_test.resizeLike(y);
+
+		out << d << ' ';
+
+		// Vector encoding is the same
+		encodeVector(encoder, scale, x_plain, x);
+		encryptor.encrypt(x_plain, x_enc);
+
+		// Row Encoding
+		encodeMatrixRows(encoder, scale, A_plain, A);
+		A_enc.resize(A_plain.size());
+		for (unsigned i = 0; i < A_plain.size(); i++) encryptor.encrypt(A_plain[i], A_enc[i]);
+
+		auto start = std::chrono::high_resolution_clock::now();
+		matrixVectorMultiplyRows(A_enc, d, x_enc, y_enc, evaluator, unitMult, gal_keys, relin_keys);
+		out << std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start)
+		               .count() /
+		           1e6
+		    << ' ';
+
+		decryptor.decrypt(y_enc, y_plain);
+		encoder.decode(y_plain, test_out);
+
+		for (unsigned i = 0; i < d; i++) y_test(i, 0) = test_out[i];
+		out << (y - y_test).norm() << ' ';
+
+		// Diagonal encoding
+		encodeMatrixDiagonal(encoder, scale, A_plain, A);
+		A_enc.resize(A_plain.size());
+		for (unsigned i = 0; i < A_plain.size(); i++) encryptor.encrypt(A_plain[i], A_enc[i]);
+
+		start = std::chrono::high_resolution_clock::now();
+		matrixVectorMultiplyDiag(A_enc, d, x_enc, y_enc, evaluator, gal_keys, relin_keys);
+		out << std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start)
+		               .count() /
+		           1e6
+		    << ' ';
+
+		decryptor.decrypt(y_enc, y_plain);
+		encoder.decode(y_plain, test_out);
+
+		for (unsigned i = 0; i < d; i++) y_test(i, 0) = test_out[i];
+		out << (y - y_test).norm() << '\n';
+
+		if (d % 10 == 0 || max_d - d < 10) std::cout << d << " complete.\n";
+	}
+}
+
+void encodeMatrixRows(CKKSEncoder& encoder, double scale, std::vector<Plaintext>& out_mat,
+                      const Eigen::MatrixXd& in_mat) {
+	out_mat.resize(in_mat.rows());
+	std::vector<double> row(in_mat.cols());
+	for (unsigned i = 0; i < in_mat.rows(); i++) {
+		for (unsigned j = 0; j < in_mat.cols(); j++) { row[j] = in_mat(i, j); }
+
+		encoder.encode(row, scale, out_mat[i]);
+	}
 }
 
 void encodeMatrixDiagonal(CKKSEncoder& encoder, double scale, std::vector<Plaintext>& out_mat,
@@ -396,6 +501,75 @@ void encodeVectorSIMD(CKKSEncoder& encoder, double scale, Plaintext& out_vec,
 	encoder.encode(vec, scale, out_vec);
 }
 
+/**
+ * @brief Perform encrypted matrix-vector multiplication with a row encoded matrix.
+ *
+ * @param      mat        The matrix to multiply. Should be row encoded with encodeMatrixRows();
+ * @param      mat_cols   Number of columns in mat.
+ * @param      vec_in     The vector to multiply.
+ * @param[out] vec_out    The result of the multiplication.
+ * @param      evaluator  The evaluator used to evaluate the math.
+ * @param      unitMult   The vector <1, 0, 0, 0, ..., 0> used for multiplication.
+ * @param      gal_keys   Galois keys needed to perform rotations.
+ * @param      relin_keys Relineraization keys needed for relineraization after multiplications.
+ */
+void matrixVectorMultiplyRows(const std::vector<Ciphertext>& mat, unsigned mat_cols, const Ciphertext& vec_in,
+                              Ciphertext& vec_out, Evaluator& evaluator, Plaintext unitMult, GaloisKeys& gal_keys,
+                              RelinKeys& relin_keys) {
+	// Each row-vector times the input vector corresponds to exactly one slot of the output, so our summands will be
+	// zero everywhere except their specific slot.
+	std::vector<Ciphertext> summands(mat.size());
+	Ciphertext temp_rotate;
+
+	for (unsigned i = 0; i < mat.size(); i++) {
+		// Take the dot product between a row vector and the input vector.
+		// The first step is the element-wise product.
+		evaluator.mod_switch_to(mat[i], vec_in.parms_id(), summands[i]);
+		evaluator.multiply_inplace(summands[i], vec_in);
+		evaluator.relinearize_inplace(summands[i], relin_keys);
+		evaluator.rescale_to_next_inplace(summands[i]);
+
+		// Next we must sum the elements. We do thise by rotating the current sum so that different elements overlap and
+		// do an elementwise sum. We rotate in a smart way so that we can use previous sums and only do log_2(d)
+		// rotations, where d is the dimensionality of the data. However, our vectors are actually very large vectors of
+		// mostly zeroes, so these zeroes "infect" the sum vector, leaving only the first slot correct. Therefore we
+		// need to multiply this by the vector <1, 0, 0, 0, ...> and rotate it so that the answer is in the correct
+		// slot.
+		for (unsigned r = 1; r < mat_cols; r *= 2) {
+			// By rotating our in-progress sum (rather than the initial dot product vector), we can make use of the
+			// previous sums
+			evaluator.rotate_vector(summands[i], r, gal_keys, temp_rotate);
+			evaluator.add_inplace(summands[i], temp_rotate);
+		}
+
+		evaluator.mod_switch_to(unitMult, summands[i].parms_id(), unitMult);
+		evaluator.multiply_plain_inplace(summands[i], unitMult);
+		evaluator.rotate_vector_inplace(summands[i], -i, gal_keys);
+		evaluator.relinearize_inplace(summands[i], relin_keys);
+		evaluator.rescale_to_next_inplace(summands[i]);
+	}
+
+	// Now our summands look like a collection of vectors:
+	// <a, 0, 0, 0, ..., 0>,
+	// <0, b, 0, 0, ..., 0>,
+	// <0, 0, c, 0, ..., 0>...
+	// where a, b, c, ... are the correct dot product of the corresponding row in the matrix and the input vector.
+	// We just sum them to end up with <a, b, c, ...>, which is the diefinition of the matrix-vector product.
+	evaluator.add_many(summands, vec_out);
+}
+
+/**
+ * @brief Perform encrypted matrix-vector multiplication with a diagonal encoded matrix.
+ *
+ * @param      mat        The matrix to multiply. Should be diagonal encoded with encodeMatrixDiagonal() or
+ *                        encodeMatrixDiagonalSIMD().
+ * @param      mat_rows   Number of rows in mat.
+ * @param      vec_in     The vector to multiply.
+ * @param[out] vec_out    The result of the multiplication.
+ * @param      evaluator  The evaluator used to evaluate the math.
+ * @param      gal_keys   Galois keys needed to perform rotations.
+ * @param      relin_keys Relineraization keys needed for relineraization after multiplications.
+ */
 void matrixVectorMultiplyDiag(const std::vector<Ciphertext>& mat, unsigned mat_rows, const Ciphertext& vec_in,
                               Ciphertext& vec_out, Evaluator& evaluator, GaloisKeys& gal_keys, RelinKeys& relin_keys) {
 	Ciphertext rotate = vec_in;

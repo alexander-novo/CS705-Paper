@@ -20,12 +20,13 @@ OBJDIRS      = $(addprefix $(OBJDIR)/, $(SOURCEDIRS))
 DEPDIRS      = $(addprefix $(DEPDIR)/, $(SOURCEDIRS))
 DEPFILES     = $(SOURCES:%.cpp=$(DEPDIR)/%.d)
 
-.PHONY: all exec clean report required
+.PHONY: all exec clean report
 .SECONDARY:
 
 # By default, make all executable targets and the outputs required for the homework
 all: exec
 exec: $(EXEC)
+report: out/matrix-encoding-comp.dat out/activation-train-comp.dat
 
 # Executable Targets
 main: $(OBJDIR)/main.o $(OBJDIR)/common.o
@@ -38,12 +39,19 @@ clean:
 	rm -rf $(OBJDIR)
 	rm -f $(EXEC)
 
+# Output files
+out/matrix-encoding-comp.dat: main out/activation-train-comp.dat
+	./main
+
+out/activation-train-comp.dat: nn-train
+	./nn-train > $@
+
 # Auto-Build .cpp files into .o
 $(OBJDIR)/%.o: %.cpp
 $(OBJDIR)/%.o: %.cpp $(DEPDIR)/%.d | $(DEPDIRS) $(OBJDIRS)
 	$(CXX) $(DEPFLAGS) $(INCLUDES) $(CXXFLAGS) -c $< -o $@
 
 # Make generated directories
-$(DEPDIRS) $(OBJDIRS): ; @mkdir -p $@
+$(DEPDIRS) $(OBJDIRS) out/: ; @mkdir -p $@
 $(DEPFILES):
 include $(wildcard $(DEPFILES))

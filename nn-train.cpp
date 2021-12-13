@@ -77,7 +77,7 @@ int main() {
 		squareParamsFile << bestWeights[i].rows() << " " << bestWeights[i].cols() << '\n' << bestWeights[i] << '\n';
 	}
 
-	std::cout << "# Accuracy of the classifier per epoch\n# ReLU    Square\n";
+	std::cout << "# Accuracy of the classifier per epoch\nReLU    Square\n";
 
 	for (unsigned i = 0; i < relu_acc.size(); i++) { std::cout << relu_acc[i] << " " << square_acc[i] << '\n'; }
 }
